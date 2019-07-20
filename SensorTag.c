@@ -108,14 +108,17 @@
  */
 
 // How often to perform periodic event (in msec)
-#define ST_PERIODIC_EVT_PERIOD               1000
+
+#define ST_PERIODIC_EVT_PERIOD                       1000
+#define ST_USER_DEFINED_PERIODIC_EVT_PERIOD          500
+
 
 // What is the advertising interval when device is discoverable
 // (units of 625us, 160=100ms)
 #define DEFAULT_ADVERTISING_INTERVAL          160
 
 // General discoverable mode advertises indefinitely
-#define DEFAULT_DISCOVERABLE_MODE             GAP_ADTYPE_FLAGS_LIMITED
+#define DEFAULT_DISCOVERABLE_MODE             GAP_ADTYPE_FLAGS_GENERAL
 
 // Minimum connection interval (units of 1.25ms, 80=100ms) if automatic
 // parameter update request is enabled
@@ -159,6 +162,7 @@
 #define ST_STATE_CHANGE_EVT                   0x0001
 #define ST_CHAR_CHANGE_EVT                    0x0002
 #define ST_PERIODIC_EVT                       0x0004
+#define ST_USER_DEFINED_PERIODIC_EVT          0x0010   // user-defined event
 #ifdef FEATURE_OAD
 #define SBP_OAD_WRITE_EVT                     0x0008
 #endif //FEATURE_OAD
@@ -166,7 +170,7 @@
 // Misc.
 #define INVALID_CONNHANDLE                    0xFFFF
 #define TEST_INDICATION_BLINKS                5  // Number of blinks
-#define BLINK_DURATION                        20 // Milliseconds
+#define BLINK_DURATION                        5 // Milliseconds
 #define OAD_PACKET_SIZE                       18
 #define KEY_STATE_OFFSET                      13 // Offset in advertising data
 
@@ -208,6 +212,7 @@ static ICall_EntityID selfEntity;
 
 // Clock instances for internal periodic events.
 static Clock_Struct periodicClock;
+static Clock_Struct UserDefined_periodicClock;  // user-defined periodic clock
 
 // Queue object used for app messages
 static Queue_Struct appMsg;
@@ -263,13 +268,19 @@ static uint8_t advertData[] =
 #endif
 
   // Manufacturer specific advertising data
-  0x06,
+  0x0C,
   GAP_ADTYPE_MANUFACTURER_SPECIFIC,
   LO_UINT16(TI_COMPANY_ID),
   HI_UINT16(TI_COMPANY_ID),
   TI_ST_DEVICE_ID,
   TI_ST_KEY_DATA_ID,
-  0x00                                    // Key state
+  0x00,                                    // Key state
+  0xFF,                                    // MY DATA1 : accX low byte
+  0xFF,                                    // MY DATA2 : accX high byte
+  0xFF,                                    // MY DATA3 : accY low byte
+  0xFF,                                    // MY DATA4 : accY high byte
+  0xFF,                                    // MY DATA5 : accZ low byte
+  0xFF                                     // MY DATA6 : accZ high byte
 };
 
 // GAP GATT Attributes
@@ -320,6 +331,9 @@ static void SensorTag_enqueueMsg(uint8_t event, uint8_t serviceID, uint8_t param
 static void SensorTag_callback(PIN_Handle handle, PIN_Id pinId);
 static bool SensorTag_hasFactoryImage(void);
 static void SensorTag_setDeviceInfo(void);
+static void StartSensor(void) ; // start sensor
+static int16_t uint8ToInt16(uint8_t LB, uint8_t  HB); // convert uint8 to int16
+
 
 #ifdef FACTORY_IMAGE
 static bool SensorTag_saveFactoryImage(void);
@@ -417,6 +431,9 @@ static void SensorTag_init(void)
   // Create one-shot clocks for internal periodic events.
   Util_constructClock(&periodicClock, SensorTag_clockHandler,
                       ST_PERIODIC_EVT_PERIOD, 0, false, ST_PERIODIC_EVT);
+  // Create periodic clocks for internal periodic events
+  Util_constructClock(&UserDefined_periodicClock, SensorTag_clockHandler,
+                       ST_USER_DEFINED_PERIODIC_EVT_PERIOD, ST_USER_DEFINED_PERIODIC_EVT_PERIOD, false, ST_USER_DEFINED_PERIODIC_EVT);
 
   // Setup the GAP
   GAP_SetParamValue(TGAP_CONN_PAUSE_PERIPHERAL, DEFAULT_CONN_PAUSE_PERIPHERAL);
@@ -496,6 +513,7 @@ static void SensorTag_init(void)
   else
   {
     SensorTag_blinkLed(Board_LED1,TEST_INDICATION_BLINKS);
+    SensorTag_blinkLed(Board_LED1,5);
   }
 
 #ifdef FACTORY_IMAGE
@@ -535,7 +553,7 @@ static void SensorTag_init(void)
 
   // Start Bond Manager
   VOID GAPBondMgr_Register(NULL);
-
+  
   // Enable interrupt handling for keys and relay
   PIN_registerIntCb(hGpioPin, SensorTag_callback);
 }
@@ -553,6 +571,15 @@ static void SensorTag_taskFxn(UArg a0, UArg a1)
 {
   // Initialize application
   SensorTag_init();
+
+  // Start a user-defined clock
+  Util_startClock(&UserDefined_periodicClock);
+
+  // dummy variable for data advertising
+  uint8_t dummy;
+
+  // start a sensor
+  StartSensor();
 
   // Application main loop
   for (;;)
@@ -623,11 +650,19 @@ static void SensorTag_taskFxn(UArg a0, UArg a1)
       // Blink green LED when advertising
       if (gapProfileState == GAPROLE_ADVERTISING)
       {
-        SensorTag_blinkLed(Board_LED2,1);
+        SensorTag_blinkLed(Board_LED2,1);    // blink greed LED
+        MysensorTag_updateAdvertisingData(); // advertise sensor reading
+
+
         #ifdef FEATURE_LCD
         SensorTag_displayBatteryVoltage();
         #endif
       }
+    }
+    else if(events & ST_USER_DEFINED_PERIODIC_EVT)
+    {
+        events &= ~ST_USER_DEFINED_PERIODIC_EVT;
+
     }
 
     #ifdef FEATURE_OAD
@@ -652,6 +687,8 @@ static void SensorTag_taskFxn(UArg a0, UArg a1)
       ICall_free(oadWriteEvt);
     }
     #endif //FEATURE_OAD
+
+
   } // task loop
 }
 
@@ -744,7 +781,6 @@ static void SensorTag_processStateChangeEvt(gaprole_States_t newState)
       uint8_t ownAddress[B_ADDR_LEN];
       uint8_t systemId[DEVINFO_SYSTEM_ID_LEN];
 
-      SensorTag_blinkLed(Board_LED2, 5);
 
       GAPRole_GetParameter(GAPROLE_BD_ADDR, ownAddress);
 
@@ -1152,6 +1188,89 @@ void sensorTag_updateAdvertisingData(uint8_t keyStatus)
   advertData[KEY_STATE_OFFSET] = keyStatus;
   GAPRole_SetParameter(GAPROLE_ADVERT_DATA, sizeof(advertData), advertData);
 }
+
+/*
+ * start sensor
+ */
+static void StartSensor(void)
+{
+    uint8_t SensorON = 1;
+    uint8_t movementSensorConfig[2] = {0x7E, 0x01};  // turn all axes on
+    static bStatus_t st1,st2,st3, st4, st5, st6, st7;
+    st1 =  Humidity_setParameter(SENSOR_CONF,1,&SensorON); // turn on
+    st5 =  Movement_setParameter(SENSOR_CONF,2, &movementSensorConfig);
+    SensorTag_enqueueMsg(ST_CHAR_CHANGE_EVT, SERVICE_ID_HUM, SENSOR_CONF); // turning sensor on using
+    SensorTag_enqueueMsg(ST_CHAR_CHANGE_EVT, SERVICE_ID_MOV, SENSOR_CONF);
+}
+
+/**
+ * Converts a two byte array to an integer
+ * @param LB: low byte, HB : high byte
+ * @return an int representing the unsigned short
+ */
+static int16_t uint8ToInt16(uint8_t LB, uint8_t  HB)
+{
+    int16_t data = 0;
+    data |= HB & 0xFF;
+    data <<= 8;
+    data |= LB & 0xFF;
+    return data;
+}
+
+void MysensorTag_updateAdvertisingData(void)
+{
+ /* MOVEMENT SENSOR DATA FORMAT (18 BYTES)
+  * data[0:1]   : gyroX  data[2:3]   : gyroY  data[4:5]   : gyroZ
+  * data[6:7]   : accX   data[8:9]   : accY   data[10:11] : accZ
+  * data[12:13] : magX   data[14:15] : magY   data[16:17] : magZ
+  */
+ uint16_t RawTemperature, RawHumidity;
+ int16_t RawAccX,RawAccY,RawAccZ; // accelerations in 16bit signed integer
+ static bStatus_t st1,st2,st3, st4, st5, st6, st7;
+ uint8_t period, config, SensorON=1, MovPeriod;
+ uint8_t MovConfig[2]; // read configuration
+ static uint8_t HumRawData[4]; // humidity sensor raw data
+ static uint8_t MovRawData[18] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}; // movement sensor raw data
+ static uint8_t counter = 0; // repetition counter
+ float temperature,humidity; // temperature and humidity measurements in Celcius and %
+ float accX,accY,accZ; // accelerationX, accelerationY, accelerationZ in G
+ static uint8_t adcRange; //adc range
+// set parameter
+// st1 =  Humidity_setParameter(SENSOR_CONF,1,&SensorON); // turn on
+// st5 =  Movement_setParameter(SENSOR_CONF, 2, &movementSensorConfig);
+// SensorTagMov_processCharChangeEvt(SENSOR_CONF);
+
+ //SensorTagHum_processCharChangeEvt(SENSOR_CONF); // enable humidity sensing
+ // SensorTag_enqueueMsg(ST_CHAR_CHANGE_EVT, SERVICE_ID_HUM, SENOSR_CONF); // turning sensor on using Queue
+
+ // get parameter
+ st2 =  Humidity_getParameter(SENSOR_PERI, &period);
+ st3 =  Humidity_getParameter(SENSOR_CONF, &config);
+ st4 =  Humidity_getParameter(SENSOR_DATA, &HumRawData);
+ st6 =  Movement_getParameter(SENSOR_DATA, &MovRawData);
+ st7 =  Movement_getParameter(SENSOR_CONF, &MovConfig);
+ st7 =  Movement_getParameter(SENSOR_PERI, &MovPeriod);
+
+ // raw temperature and humidity, acceleration
+ RawTemperature = HumRawData[0] | (HumRawData[1]<<8);
+ RawHumidity = HumRawData[2] | (HumRawData[3]<<8);
+ RawAccZ =   uint8ToInt16(MovRawData[10],MovRawData[11]);
+ sensorHdc1000Convert(RawTemperature, RawHumidity,&temperature, &humidity);
+
+ // convert raw acc value into in G at max. 4G configuration(1)
+ adcRange = sensorMpu9250AccReadRange() * 4; // 0:2G, 1:4G, 2:8G, 3:16G
+ accZ = (RawAccZ * 1.0) / 32768 * adcRange;
+
+ // update advertisement data
+ advertData[KEY_STATE_OFFSET+1] = MovRawData[6];   //accX Low Byte
+ advertData[KEY_STATE_OFFSET+2] = MovRawData[7];   //accX High Byte
+ advertData[KEY_STATE_OFFSET+3] = MovRawData[8];   //accY Low Byte
+ advertData[KEY_STATE_OFFSET+4] = MovRawData[9];   //accY High Byte
+ advertData[KEY_STATE_OFFSET+5] = MovRawData[10];  //accZ Low Byte
+ advertData[KEY_STATE_OFFSET+6] = MovRawData[11];  //accZ High Byte
+ GAPRole_SetParameter(GAPROLE_ADVERT_DATA, sizeof(advertData), advertData);
+}
+
 
 
 #ifdef FACTORY_IMAGE
