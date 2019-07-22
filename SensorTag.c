@@ -103,6 +103,12 @@
   #include "oad.h"
 #endif
 
+
+// my files
+
+#include "ahrs_bgloh.h"
+
+
 /*******************************************************************************
  * CONSTANTS
  */
@@ -650,8 +656,9 @@ static void SensorTag_taskFxn(UArg a0, UArg a1)
       // Blink green LED when advertising
       if (gapProfileState == GAPROLE_ADVERTISING)
       {
-        SensorTag_blinkLed(Board_LED2,1);    // blink greed LED
+        SensorTag_blinkLed(Board_LED1,5);    // blink greed LED
         MysensorTag_updateAdvertisingData(); // advertise sensor reading
+        System_printf("gVariable1:%d \n", gVariable1++);
 
 
         #ifdef FEATURE_LCD
